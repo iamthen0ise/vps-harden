@@ -391,7 +391,7 @@ verify_ssh_access() {
 # ── Module: prereqs ─────────────────────────────────────────────────────────
 mod_prereqs() {
     log_header "Module: prereqs"
-    local pkgs=(curl wget jq htop tree unzip ufw fail2ban netcat-openbsd telnet iputils-ping cron dnsutils net-tools traceroute lsof)
+    local pkgs=(curl wget jq htop tree unzip ufw fail2ban netcat-openbsd telnet iputils-ping cron dnsutils net-tools traceroute lsof tcpdump)
     local to_install=()
 
     for pkg in "${pkgs[@]}"; do
