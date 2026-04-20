@@ -5,10 +5,10 @@
 set -euo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
-readonly SCRIPT_VERSION="1.4.0"
+readonly SCRIPT_VERSION="1.5.0"
 LOG_FILE="/var/log/vps-harden-$(date +%Y%m%d-%H%M%S).log"
 readonly LOG_FILE
-readonly ALL_MODULES="prereqs user ssh firewall fail2ban sysctl netbird firewall_tighten sops upgrades monitoring shell misc agent_secrets agent_webhook_auth agent_logging agent_data verify"
+readonly ALL_MODULES="prereqs user ssh firewall fail2ban sysctl netbird firewall_tighten sops upgrades monitoring shell misc docker agent_secrets agent_webhook_auth agent_logging agent_data verify"
 readonly SOPS_FALLBACK_VERSION="3.9.4"
 
 # ── Color output ─────────────────────────────────────────────────────────────
@@ -140,6 +140,7 @@ SSH_KEY_CONTENT=""
 AGENT_DIR=""
 WEBHOOK_PORT="5000"
 AGENT_DATA_DIR=""
+USER_PASSWORD=""
 
 # ── Distro detection ────────────────────────────────────────────────────────
 check_distro() {
@@ -204,6 +205,7 @@ Optional:
   --agent-dir DIR        AI agent workspace directory (enables agent modules)
   --webhook-port PORT    Webhook listener port (default: 5000)
   --agent-data-dir DIR   Sensitive data directory to protect (e.g. health data)
+  --user-password PASS   Set system password for the created user
   --skip MOD[,MOD]       Comma-separated modules to skip
   --only MOD[,MOD]       Only run specified modules (comma-separated)
   --dry-run              Show what would change, change nothing
@@ -215,7 +217,7 @@ Optional:
 
 Modules (execution order):
   prereqs user ssh firewall fail2ban sysctl netbird firewall_tighten
-  sops upgrades monitoring shell misc
+  sops upgrades monitoring shell misc docker
   agent_secrets agent_webhook_auth agent_logging agent_data  (need --agent-dir)
   verify
 
@@ -262,6 +264,7 @@ parse_config_file() {
             agent_dir)      AGENT_DIR="$value" ;;
             webhook_port)   WEBHOOK_PORT="$value" ;;
             agent_data_dir) AGENT_DATA_DIR="$value" ;;
+            user_password)  USER_PASSWORD="$value" ;;
             skip)           SKIP_MODULES="$value" ;;
             only)           ONLY_MODULES="$value" ;;
         esac
@@ -282,6 +285,7 @@ parse_args() {
             --agent-dir)      AGENT_DIR="$2"; shift 2 ;;
             --webhook-port)   WEBHOOK_PORT="$2"; shift 2 ;;
             --agent-data-dir) AGENT_DATA_DIR="$2"; shift 2 ;;
+            --user-password)  USER_PASSWORD="$2"; shift 2 ;;
             --skip)           SKIP_MODULES="$2"; shift 2 ;;
             --only)           ONLY_MODULES="$2"; shift 2 ;;
             --interactive)    INTERACTIVE="true"; shift ;;
@@ -387,7 +391,7 @@ verify_ssh_access() {
 # ── Module: prereqs ─────────────────────────────────────────────────────────
 mod_prereqs() {
     log_header "Module: prereqs"
-    local pkgs=(curl wget jq htop tree unzip ufw fail2ban)
+    local pkgs=(curl wget jq htop tree unzip ufw fail2ban netcat-openbsd telnet iputils-ping cron dnsutils net-tools traceroute lsof)
     local to_install=()
 
     for pkg in "${pkgs[@]}"; do
@@ -450,6 +454,16 @@ mod_user() {
 
         chmod 600 "$auth_file"
         chown -R "${USERNAME}:${USERNAME}" "$ssh_dir"
+    fi
+
+    # Set user password if provided
+    if [[ -n "$USER_PASSWORD" ]]; then
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log_dry "Set password for $USERNAME"
+        else
+            echo "${USERNAME}:${USER_PASSWORD}" | chpasswd
+            log_info "Password set for $USERNAME"
+        fi
     fi
 }
 
@@ -642,6 +656,10 @@ net.ipv4.icmp_ignore_bogus_error_responses = 1
 # Reverse path filtering
 net.ipv4.conf.all.rp_filter = 1
 net.ipv4.conf.default.rp_filter = 1
+
+# IP forwarding (required for VPN/tunnel routing)
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
 SYSEOF
 )
 
@@ -1258,6 +1276,99 @@ mod_misc() {
             log_info "Restricted su to sudo group"
         fi
     fi
+}
+
+# ── Module: docker ───────────────────────────────────────────────────────────
+mod_docker() {
+    log_header "Module: docker"
+
+    # Remove old/conflicting Docker packages
+    local old_pkgs=(docker.io docker-doc docker-compose docker-compose-v2 podman-docker containerd runc)
+    local to_remove=()
+    for pkg in "${old_pkgs[@]}"; do
+        if dpkg -l "$pkg" 2>/dev/null | grep -q "^ii"; then
+            to_remove+=("$pkg")
+        fi
+    done
+    if [[ ${#to_remove[@]} -gt 0 ]]; then
+        log_info "Removing conflicting packages: ${to_remove[*]}"
+        run_cmd apt-get remove -y -qq "${to_remove[@]}"
+    fi
+
+    # Install Docker if not already present
+    if command -v docker &>/dev/null; then
+        local docker_ver
+        docker_ver=$(docker --version 2>/dev/null | awk '{print $3}' | tr -d ',')
+        log_info "Docker already installed ($docker_ver)"
+    else
+        log_info "Installing Docker Engine (official apt repo)"
+
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log_dry "Add Docker GPG key and apt repo"
+            log_dry "apt-get install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"
+        else
+            # Prerequisites for apt over HTTPS
+            run_cmd apt-get update -qq
+            run_cmd apt-get install -y -qq ca-certificates curl
+
+            # Docker GPG key
+            install -m 0755 -d /etc/apt/keyrings
+            curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+                -o /etc/apt/keyrings/docker.asc >> "$LOG_FILE" 2>&1
+            chmod a+r /etc/apt/keyrings/docker.asc
+            log_info "Docker GPG key added"
+
+            # Docker apt repository
+            local arch codename
+            arch=$(dpkg --print-architecture)
+            # shellcheck source=/dev/null
+            codename=$(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
+            echo "deb [arch=${arch} signed-by=/etc/apt/keyrings/docker.asc] \
+https://download.docker.com/linux/ubuntu ${codename} stable" \
+                > /etc/apt/sources.list.d/docker.list
+            log_info "Docker apt repo added ($codename $arch)"
+
+            # Install Docker Engine
+            run_cmd apt-get update -qq
+            run_cmd apt-get install -y -qq \
+                docker-ce docker-ce-cli containerd.io \
+                docker-buildx-plugin docker-compose-plugin
+        fi
+    fi
+
+    # Enable and start Docker service
+    if [[ "$DRY_RUN" != "true" ]]; then
+        if ! systemctl is-enabled docker &>/dev/null; then
+            run_cmd systemctl enable docker
+        else
+            log_info "Docker service already enabled"
+        fi
+        if ! systemctl is-active docker &>/dev/null; then
+            run_cmd systemctl start docker
+        else
+            log_info "Docker service already running"
+        fi
+    else
+        log_dry "systemctl enable docker && systemctl start docker"
+    fi
+
+    # Add user to docker group (post-install step)
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_dry "Add $USERNAME to docker group"
+    else
+        if getent group docker &>/dev/null; then
+            if groups "$USERNAME" | grep -qw docker; then
+                log_info "$USERNAME already in docker group"
+            else
+                run_cmd usermod -aG docker "$USERNAME"
+                log_info "Added $USERNAME to docker group (re-login required to take effect)"
+            fi
+        else
+            log_warn "docker group not found — skipping group membership"
+        fi
+    fi
+
+    log_ok "Docker module complete"
 }
 
 # ── Module: agent_secrets — Scan for plaintext secrets ────────────────────────
@@ -1943,6 +2054,14 @@ mod_verify() {
         sc_add "WARN" "Martian logging disabled" "will fix"
     fi
 
+    local ip_forward
+    ip_forward=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo "0")
+    if [[ "$ip_forward" == "1" ]]; then
+        sc_add "PASS" "IP forwarding enabled (tunnel routing)"
+    else
+        sc_add "WARN" "IP forwarding disabled" "will fix"
+    fi
+
     # Auditd
     sc_add "SECTION" "Monitoring — Tracks system activity and threats"
     if command -v auditctl &>/dev/null; then
@@ -1994,6 +2113,26 @@ mod_verify() {
         sc_add "PASS" "SOPS + age installed"
     else
         sc_add "WARN" "SOPS and/or age not installed" "will fix"
+    fi
+
+    # Docker
+    sc_add "SECTION" "Docker — Container runtime"
+    if command -v docker &>/dev/null; then
+        local docker_ver
+        docker_ver=$(docker --version 2>/dev/null | awk '{print $3}' | tr -d ',')
+        sc_add "PASS" "Docker installed ($docker_ver)"
+        if systemctl is-active docker &>/dev/null; then
+            sc_add "PASS" "Docker service running"
+        else
+            sc_add "WARN" "Docker installed but service not running" "will fix"
+        fi
+        if groups "$USERNAME" 2>/dev/null | grep -qw docker; then
+            sc_add "PASS" "$USERNAME in docker group"
+        else
+            sc_add "WARN" "$USERNAME not in docker group" "will fix"
+        fi
+    else
+        sc_add "WARN" "Docker not installed" "will fix"
     fi
 
     # Unattended upgrades
@@ -2269,8 +2408,34 @@ interactive_setup() {
     USERNAME="${input:-$default_user}"
     echo ""
 
-    # ── Step 2: SSH Public Key ───────────────────────────────────────────
-    echo -e "${BOLD}2. SSH Public Key${NC}"
+    # ── Step 2: User Password ────────────────────────────────────────────
+    echo -e "${BOLD}2. User Password (optional)${NC}"
+    echo "   System password for sudo and console access."
+    echo "   SSH stays key-only regardless of this setting."
+    local pw1 pw2
+    while true; do
+        printf "   Password (Enter to skip): "
+        read -rs pw1
+        echo ""
+        if [[ -z "$pw1" ]]; then
+            USER_PASSWORD=""
+            log_info "No password set for $USERNAME"
+            break
+        fi
+        printf "   Confirm password: "
+        read -rs pw2
+        echo ""
+        if [[ "$pw1" == "$pw2" ]]; then
+            USER_PASSWORD="$pw1"
+            log_info "Password will be set for $USERNAME"
+            break
+        fi
+        echo -e "   ${RED}Passwords do not match, try again.${NC}"
+    done
+    echo ""
+
+    # ── Step 3: SSH Public Key ───────────────────────────────────────────
+    echo -e "${BOLD}3. SSH Public Key${NC}"
     echo "   Your public key for passwordless SSH login."
     echo "   Without this, you'll be locked out when password auth is disabled."
 
@@ -2404,8 +2569,8 @@ interactive_setup() {
     fi
     echo ""
 
-    # ── Step 3: Safety IP ────────────────────────────────────────────────
-    echo -e "${BOLD}3. SSH Safety IP${NC}"
+    # ── Step 4: Safety IP ────────────────────────────────────────────────
+    echo -e "${BOLD}4. SSH Safety IP${NC}"
     echo "   A fallback IP that can always reach SSH port 22, even if the"
     echo "   VPN tunnel goes down. Usually your current public IP."
     local detected_ip
@@ -2425,8 +2590,8 @@ interactive_setup() {
     fi
     echo ""
 
-    # ── Step 4: Timezone ─────────────────────────────────────────────────
-    echo -e "${BOLD}4. Timezone${NC}"
+    # ── Step 5: Timezone ─────────────────────────────────────────────────
+    echo -e "${BOLD}5. Timezone${NC}"
     echo "   System timezone for logs and cron jobs."
     local detected_tz
     detected_tz=$(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || echo "UTC")
@@ -2440,8 +2605,8 @@ interactive_setup() {
     fi
     echo ""
 
-    # ── Step 5: Netbird Key ──────────────────────────────────────────────
-    echo -e "${BOLD}5. Netbird VPN Setup Key (optional)${NC}"
+    # ── Step 6: Netbird Key ──────────────────────────────────────────────
+    echo -e "${BOLD}6. Netbird VPN Setup Key (optional)${NC}"
     echo "   Connects this server to your Netbird mesh network."
     echo "   Get a setup key from app.netbird.io → Setup Keys."
     local default_nb="${NETBIRD_KEY:-}"
@@ -2454,8 +2619,8 @@ interactive_setup() {
     NETBIRD_KEY="${input:-$default_nb}"
     echo ""
 
-    # ── Step 6: Dry Run ──────────────────────────────────────────────────
-    echo -e "${BOLD}6. Dry Run?${NC}"
+    # ── Step 7: Dry Run ──────────────────────────────────────────────────
+    echo -e "${BOLD}7. Dry Run?${NC}"
     echo "   A dry run shows what would change without making changes."
     echo "   Recommended for the first run."
     printf "   Start with dry run? [Y/n]: "

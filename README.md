@@ -47,7 +47,7 @@ Most VPS hardening guides are long checklists you follow manually. Most scripts 
 **Install:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ranjith-src/vps-harden/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/iamthen0ise/vps-harden/main/install.sh | bash
 ```
 
 **Interactive wizard (recommended for first run):**
